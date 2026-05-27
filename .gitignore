@@ -1,2 +1,7 @@
 SoM_paper.pdf
 USplat4D_paper.pdf
+
+__pycache__/
+usplat4d/__pycache__/
+*.pyc
+usplat4d/__pycache__/*.pyc

@@ -168,6 +168,10 @@ def compute_scalar_uncertainty(
     # ── Combine into final uncertainty (eq. 5) ────────────────────────────────
     # σ²_{i,t} = 1 / Σ_h (v^h_i)²  ;  clamp denominator to avoid division by zero.
     sigma2 = 1.0 / (sigma2_inv + 1e-10)  # (G, T)
+    # Invisible Gaussians (no pixel contribution) have sigma2_inv=0 → sigma2=1e10.
+    # Their convergence indicator is vacuously 1 (no covered pixels → all converged).
+    # Force indicator=0 so they receive phi instead of 1/eps.
+    indicator[sigma2_inv == 0] = 0
     u = indicator * sigma2 + (1.0 - indicator) * phi
 
     return u

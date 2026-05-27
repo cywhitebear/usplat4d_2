@@ -38,27 +38,41 @@ def compute_motion_loss(
     lambda_vel: float   = 0.01,
     lambda_acc: float   = 0.01,
     delta: int          = 1,
+    node_chunk_size: int = 512,
 ) -> Tensor:
     """Total motion locality loss for a set of nodes.
 
     Parameters
     ----------
-    positions  : (N, T, 3)
-    quats      : (N, T, 4)  wxyz, unit-normalized
-    transforms : (N, T, 3, 4)  SE(3) from compute_transforms (used in L_rigid)
-    edges      : (N, E) indices into the N dimension (for each node, its neighbors)
-    weights    : (N, E) edge weights
-    delta      : time interval Δ for rigidity and rotation losses
+    positions       : (N, T, 3)
+    quats           : (N, T, 4)  wxyz, unit-normalized
+    transforms      : (N, T, 3, 4)  SE(3) from compute_transforms (used in L_rigid)
+    edges           : (N, E) indices into the N dimension (for each node, its neighbors)
+    weights         : (N, E) edge weights
+    delta           : time interval Δ for rigidity and rotation losses
+    node_chunk_size : process nodes in chunks to bound peak VRAM; 0 = no chunking
 
     Returns
     -------
     Scalar loss tensor.
     """
-    L_iso   = isometry_loss(positions, edges, weights)
+    N = positions.shape[0]
+    use_chunks = node_chunk_size > 0 and N > node_chunk_size
+
+    if use_chunks:
+        L_iso = _iso_loss_chunked(positions, edges, weights, node_chunk_size)
+    else:
+        L_iso = isometry_loss(positions, edges, weights)
+
     L_rigid = rigidity_loss(positions, transforms, edges, weights, delta)
     L_rot   = rotation_loss(quats, edges, weights, delta)
-    L_vel   = velocity_loss(positions, quats)
-    L_acc   = acceleration_loss(positions, quats)
+
+    if use_chunks:
+        L_vel = _vel_loss_chunked(positions, quats, node_chunk_size)
+        L_acc = _acc_loss_chunked(positions, quats, node_chunk_size)
+    else:
+        L_vel = velocity_loss(positions, quats)
+        L_acc = acceleration_loss(positions, quats)
 
     return (lambda_iso   * L_iso
           + lambda_rigid * L_rigid
@@ -257,6 +271,80 @@ def acceleration_loss(
     loss_q = acc_q[..., 1:].abs().sum(dim=-1).mean()
 
     return loss_p + loss_q
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Chunked helpers (bound peak VRAM for large N)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _iso_loss_chunked(
+    positions: Tensor,  # (N, T, 3)
+    edges: Tensor,      # (N, E)
+    weights: Tensor,    # (N, E)
+    chunk_size: int,
+) -> Tensor:
+    """isometry_loss computed in node chunks to avoid the O(N*E*T) tensor."""
+    N, T, _ = positions.shape
+    _, E = edges.shape
+    p0 = positions[:, 0, :]   # (N, 3) — needed for full neighbor lookup
+    total = positions.new_tensor(0.0)
+    for start in range(0, N, chunk_size):
+        end   = min(start + chunk_size, N)
+        C     = end - start
+        p0_c  = p0[start:end]                                           # (C, 3)
+        e_c   = edges[start:end]                                        # (C, E)
+        w_c   = weights[start:end]                                      # (C, E)
+        p0_nb = p0[e_c.reshape(-1)].reshape(C, E, 3)                   # (C, E, 3)
+        d0    = (p0_c.unsqueeze(1) - p0_nb).norm(dim=-1)               # (C, E)
+        p_nb  = positions[e_c.reshape(-1), :, :].reshape(C, E, T, 3)  # (C, E, T, 3)
+        p_c   = positions[start:end]                                    # (C, T, 3)
+        d_t   = (p_c.unsqueeze(1) - p_nb).norm(dim=-1)                 # (C, E, T)
+        diff  = (d0.unsqueeze(-1) - d_t).abs()                         # (C, E, T)
+        total = total + (w_c.unsqueeze(-1) * diff).sum()
+    return total / (E * N * T + 1e-8)
+
+
+def _vel_loss_chunked(
+    positions: Tensor,  # (N, T, 3)
+    quats: Tensor,      # (N, T, 4)
+    chunk_size: int,
+) -> Tensor:
+    """velocity_loss computed in node chunks to avoid large _quat_mult tensors."""
+    N, T, _ = positions.shape
+    if T < 2:
+        return positions.new_tensor(0.0)
+    total = positions.new_tensor(0.0)
+    for start in range(0, N, chunk_size):
+        end   = min(start + chunk_size, N)
+        pos_c = positions[start:end]
+        q_c   = quats[start:end]
+        dp    = (pos_c[:, 1:] - pos_c[:, :-1]).abs().sum(dim=-1).sum()
+        dq    = _quat_mult(_quat_inv(q_c[:, :-1, :]), q_c[:, 1:, :])
+        total = total + dp + dq[..., 1:].abs().sum(dim=-1).sum()
+    return total / (N * (T - 1) + 1e-8)
+
+
+def _acc_loss_chunked(
+    positions: Tensor,  # (N, T, 3)
+    quats: Tensor,      # (N, T, 4)
+    chunk_size: int,
+) -> Tensor:
+    """acceleration_loss computed in node chunks to avoid large _quat_mult tensors."""
+    N, T, _ = positions.shape
+    if T < 3:
+        return positions.new_tensor(0.0)
+    total = positions.new_tensor(0.0)
+    for start in range(0, N, chunk_size):
+        end   = min(start + chunk_size, N)
+        pos_c = positions[start:end]
+        q_c   = quats[start:end]
+        acc_p = (pos_c[:, :-2] - 2.0 * pos_c[:, 1:-1] + pos_c[:, 2:]).abs().sum(dim=-1).sum()
+        q0, q1, q2 = q_c[:, :-2, :], q_c[:, 1:-1, :], q_c[:, 2:, :]
+        dq01  = _quat_mult(_quat_inv(q0), q1)
+        dq12  = _quat_mult(_quat_inv(q1), q2)
+        acc_q = _quat_mult(_quat_inv(dq01), dq12)
+        total = total + acc_p + acc_q[..., 1:].abs().sum(dim=-1).sum()
+    return total / (N * (T - 2) + 1e-8)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
