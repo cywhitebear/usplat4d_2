@@ -52,7 +52,7 @@ def compute_scalar_uncertainty(
     img_wh: tuple[int, int],   # (W, H)
     eta_c: float = 0.5,
     phi: float = 1e6,
-    chunk_size: int = 64,
+    chunk_size: int = 256,
     device: torch.device | None = None,
     verbose: bool = True,
 ) -> Tensor:
@@ -93,6 +93,10 @@ def compute_scalar_uncertainty(
     indicator  = torch.ones(G, T, device=device)    # product of convergence flags
 
     n_chunks = math.ceil(G / chunk_size)
+
+    # Pre-allocate tag_colors once.  Each chunk writes its C rows, renders, then
+    # zeros them back — total zero-fill cost is O(C²) per chunk, not O(G×C).
+    tag_colors = torch.zeros(G, chunk_size, device=device)
 
     for t in range(T):
         if verbose and t % 10 == 0:
@@ -168,10 +172,10 @@ def compute_scalar_uncertainty(
     # ── Combine into final uncertainty (eq. 5) ────────────────────────────────
     # σ²_{i,t} = 1 / Σ_h (v^h_i)²  ;  clamp denominator to avoid division by zero.
     sigma2 = 1.0 / (sigma2_inv + 1e-10)  # (G, T)
-    # Invisible Gaussians (no pixel contribution) have sigma2_inv=0 → sigma2=1e10.
+    # Invisible Gaussians (no pixel contribution) have sigma2_inv~=0 → sigma2=1e10.
     # Their convergence indicator is vacuously 1 (no covered pixels → all converged).
     # Force indicator=0 so they receive phi instead of 1/eps.
-    indicator[sigma2_inv == 0] = 0
+    indicator[sigma2_inv < 1.0 / phi] = 0
     u = indicator * sigma2 + (1.0 - indicator) * phi
 
     return u
